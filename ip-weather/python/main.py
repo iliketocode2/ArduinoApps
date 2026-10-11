@@ -1,21 +1,20 @@
+import json
 import os
+import threading
 import time
 
 import numpy as np
+import paho.mqtt.client as mqtt
 import requests
 from arduino.app_utils import App, Bridge, Frame
 
-# Boston, MA
-LATITUDE = 42.3601
-LONGITUDE = -71.0589
-WEATHER_URL = (
-    "https://api.open-meteo.com/v1/forecast"
-    f"?latitude={LATITUDE}&longitude={LONGITUDE}"
-    "&current=temperature_2m&temperature_unit=fahrenheit&timezone=America%2FNew_York"
-)
+from weather_payload import TOPIC, URL, build_payload, short_label
 
-REFRESH_SECONDS = 600  # re-fetch weather every 10 minutes
+BROKER_HOST = "test.mosquitto.org"
+BROKER_PORT = 1883
+REFRESH_SECONDS = 300  # re-fetch weather every 5 minutes (Open-Meteo updates "current" every 15)
 RETRY_SECONDS = 15  # retry sooner if the last fetch failed (e.g. WiFi not up yet)
+HEARTBEAT_SECONDS = 60  # re-publish the latest reading so listeners know the board is alive
 SCROLL_DELAY = 0.12  # seconds between animation steps
 MATRIX_ROWS = 8
 MATRIX_COLS = 13
@@ -37,6 +36,22 @@ FONT = {
     "F": ["111", "100", "111", "100", "100"],
     ".": ["000", "000", "000", "000", "010"],
     " ": ["000", "000", "000", "000", "000"],
+    # letters for the weather word (CLEAR, CLOUD, FOG, RAIN, ICE, SNOW, STORM)
+    "A": ["010", "101", "111", "101", "101"],
+    "C": ["111", "100", "100", "100", "111"],
+    "D": ["110", "101", "101", "101", "110"],
+    "E": ["111", "100", "111", "100", "111"],
+    "G": ["111", "100", "101", "101", "111"],
+    "I": ["111", "010", "010", "010", "111"],
+    "L": ["100", "100", "100", "100", "111"],
+    "M": ["101", "111", "111", "101", "101"],
+    "N": ["110", "101", "101", "101", "101"],
+    "O": ["111", "101", "101", "101", "111"],
+    "R": ["110", "101", "110", "101", "101"],
+    "S": ["111", "100", "111", "001", "111"],
+    "T": ["111", "010", "010", "010", "010"],
+    "U": ["101", "101", "101", "101", "111"],
+    "W": ["101", "101", "111", "111", "101"],
 }
 
 
@@ -56,13 +71,14 @@ def build_bitmap(text: str) -> np.ndarray:
     return bitmap
 
 
-def fetch_boston_temperature():
-    """Temperature in F, or None if the web request fails (no internet, API down)."""
+def fetch_weather():
+    """The weather payload (see weather_payload.py), or None if the web
+    request fails (no internet, API down)."""
     try:
-        response = requests.get(WEATHER_URL, timeout=10)
+        response = requests.get(URL, timeout=10)
         response.raise_for_status()
-        return round(response.json()["current"]["temperature_2m"])
-    except (requests.RequestException, KeyError, ValueError) as e:
+        return build_payload(response.json())
+    except (requests.RequestException, KeyError, ValueError, TypeError) as e:
         print(f"Weather fetch failed: {e}")
         return None
 
@@ -88,23 +104,75 @@ class Marquee:
         return self.padded[:, idx]
 
 
+# ------------------------------------------------------------------- MQTT
+# Retained: a game that subscribes later gets the latest reading at once.
+# connect_async + loop_start: a broker that's down at boot doesn't crash the
+# app; paho keeps reconnecting in the background.
+def on_connect(client, userdata, flags, reason_code, properties):
+    print(f"MQTT connected ({reason_code}); publishing weather to {TOPIC}")
+    client.publish(TOPIC + "/status", "online", qos=1, retain=True)
+
+
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+mqtt_client.on_connect = on_connect
+mqtt_client.will_set(TOPIC + "/status", "offline", qos=1, retain=True)
+mqtt_client.reconnect_delay_set(min_delay=1, max_delay=60)
+mqtt_client.connect_async(BROKER_HOST, BROKER_PORT, keepalive=30)
+mqtt_client.loop_start()
+
+
+# ---------------------------------------------------------------- weather
+# Fetching runs on its own thread so a slow request never stalls the scroll.
+state_lock = threading.Lock()
+latest = None  # newest weather payload
+
+
+def publish(payload):
+    msg = json.dumps(dict(payload, sent=int(time.time())), separators=(",", ":"))
+    mqtt_client.publish(TOPIC, msg, qos=1, retain=True)
+
+
+def weather_loop():
+    global latest
+    next_fetch = 0.0
+    last_publish = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= next_fetch:
+            payload = fetch_weather()
+            if payload is not None:
+                with state_lock:
+                    latest = payload
+                print(f"Tufts weather: {short_label(payload)}, board IP: {get_ip_address()}")
+                publish(payload)
+                last_publish = now
+            next_fetch = now + (REFRESH_SECONDS if payload is not None else RETRY_SECONDS)
+        with state_lock:
+            payload = latest
+        if payload is not None and now - last_publish >= HEARTBEAT_SECONDS:
+            publish(payload)
+            last_publish = now
+        time.sleep(1)
+
+
+threading.Thread(target=weather_loop, name="weather", daemon=True).start()
+
+
+# ---------------------------------------------------------------- display
 temp_marquee = None
+temp_text = None
 ip_marquee = None
-next_fetch = 0.0
 showing_temp = True
 
 
 def update_display():
-    global temp_marquee, ip_marquee, next_fetch, showing_temp
+    global temp_marquee, temp_text, ip_marquee, showing_temp
 
-    now = time.monotonic()
-    if temp_marquee is None or now >= next_fetch:
-        temp = fetch_boston_temperature()
-        ip = get_ip_address()
-        print(f"Boston temperature: {temp}F, board IP: {ip}")
-        temp_marquee = Marquee(f"{temp}F" if temp is not None else "--F")
-        ip_marquee = Marquee(ip)
-        next_fetch = now + (REFRESH_SECONDS if temp is not None else RETRY_SECONDS)
+    with state_lock:
+        text = short_label(latest)
+    if text != temp_text:
+        temp_text, temp_marquee = text, Marquee(text)
+        ip_marquee = Marquee(get_ip_address())
 
     marquee = temp_marquee if showing_temp else ip_marquee
     frame_bytes = Frame(marquee.next_frame()).to_board_bytes()
